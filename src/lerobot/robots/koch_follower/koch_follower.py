@@ -69,7 +69,7 @@ class KochFollower(Robot):
     @property
     def _cameras_ft(self) -> dict[str, tuple]:
         return {
-            cam: (self.config.cameras[cam].height, self.config.cameras[cam].width, 3) for cam in self.cameras
+            cam: (self.config.cameras[cam].height, self.config.cameras[cam].width, 1) for cam in self.cameras
         }
 
     @cached_property
@@ -188,7 +188,8 @@ class KochFollower(Robot):
 
         # Read arm position
         start = time.perf_counter()
-        obs_dict = self.bus.sync_read("Present_Position")
+        # obs_dict = self.bus.sync_read("Present_Position")
+        obs_dict = self.bus.sync_read("Present_Position", num_retry=3)
         obs_dict = {f"{motor}.pos": val for motor, val in obs_dict.items()}
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} read state: {dt_ms:.1f}ms")
