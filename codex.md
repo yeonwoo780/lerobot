@@ -16,3 +16,8 @@
 - 위의 모든 항목이 반응형 react ui에서 실행 가능
 - 현재 lerobot에 대한 가상환경은 만들어 져 있음
 - 웹에서 lerobot에 대한 정보 찾아서 내가 원하는 항목 개발
+
+codex resume 019cfa91-857b-70c0-97ba-40bc49b046d3
+
+카메라 설정이랑, dataset visualize가 없는거 같다. 데이터는 영상으로 보면서 추가/삭제/변경이 가능해야한다.
+task에 top, front 카메라 설정이 가능하게 만들어라
