@@ -30,6 +30,59 @@ body {
   padding: 16px;
 }
 
+.app-shell {
+  display: grid;
+  grid-template-columns: 260px minmax(0, 1fr);
+  gap: 14px;
+}
+
+.nav-sidebar {
+  height: fit-content;
+  position: sticky;
+  top: 12px;
+}
+
+.nav-btn {
+  width: 100%;
+  text-align: left;
+  margin-bottom: 8px;
+}
+
+.nav-btn.active {
+  background: #0f6db8;
+  color: #fff;
+}
+
+.main-content {
+  min-width: 0;
+}
+
+.viz-layout {
+  display: grid;
+  grid-template-columns: 280px minmax(0, 1fr);
+  gap: 14px;
+}
+
+.episode-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 70vh;
+  overflow: auto;
+}
+
+.episode-item {
+  text-align: left;
+  background: #fff;
+  color: var(--text);
+  border: 1px solid var(--line);
+}
+
+.episode-item.active {
+  border-color: #8bc0f2;
+  background: #eef7ff;
+}
+
 .header {
   background: linear-gradient(135deg, #0c6db7, #0a8e9a);
   color: #fff;
@@ -191,11 +244,23 @@ pre {
 }
 
 @media (max-width: 1000px) {
+  .app-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .nav-sidebar {
+    position: static;
+  }
+
   .grid {
     grid-template-columns: 1fr;
   }
 
   .form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .viz-layout {
     grid-template-columns: 1fr;
   }
 }
