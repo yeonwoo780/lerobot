@@ -1,6 +1,7 @@
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -38,6 +39,28 @@ class Job:
 JOBS: dict[str, Job] = {}
 JOBS_LOCK = threading.Lock()
 MAX_LOG_LINES = 800
+
+
+def _is_path_within(path: Path, base: Path) -> bool:
+    try:
+        path.relative_to(base)
+        return True
+    except ValueError:
+        return False
+
+
+def _validate_deletable_path(target: Path) -> None:
+    target = target.resolve()
+    cache_root = HF_CACHE_DIR.resolve()
+    outputs_root = OUTPUTS_DIR.resolve()
+
+    in_cache = _is_path_within(target, cache_root)
+    in_outputs = _is_path_within(target, outputs_root)
+    if not (in_cache or in_outputs):
+        raise ValueError("Only paths under HF cache or outputs can be deleted.")
+
+    if target == cache_root or target == outputs_root:
+        raise ValueError("Refusing to delete root directory.")
 
 
 def _repo_id_to_local_root(repo_id: str) -> Path:
@@ -128,9 +151,12 @@ def _write_local_dataset(
 
 def _episode_video_entries(info: dict, episodes_df: pd.DataFrame, root: Path, ep_idx: int) -> list[dict]:
     out: list[dict] = []
-    if ep_idx < 0 or ep_idx >= len(episodes_df):
+    if "episode_index" not in episodes_df.columns:
         return out
-    row = episodes_df.iloc[ep_idx]
+    matches = episodes_df[episodes_df["episode_index"].astype(int) == int(ep_idx)]
+    if len(matches) == 0:
+        return out
+    row = matches.iloc[0]
 
     video_path_tpl = info.get("video_path")
     if not video_path_tpl:
@@ -160,6 +186,137 @@ def _episode_video_entries(info: dict, episodes_df: pd.DataFrame, root: Path, ep
         )
 
     return out
+
+
+def _check_dataset_integrity(repo_id: str) -> dict:
+    root, info, tasks_df, episodes_df, data_df = _load_local_dataset(repo_id)
+    issues: list[str] = []
+    warnings: list[str] = []
+
+    if len(episodes_df) == 0:
+        issues.append("No episodes found in meta/episodes.")
+    if len(data_df) == 0:
+        issues.append("No frames found in data parquet.")
+
+    # Basic metadata checks
+    if "episode_index" not in episodes_df.columns:
+        issues.append("episodes parquet missing 'episode_index'.")
+    if "episode_index" not in data_df.columns:
+        issues.append("data parquet missing 'episode_index'.")
+
+    fps = int(info.get("fps", 30))
+    expected_eps = int(info.get("total_episodes", -1))
+    expected_frames = int(info.get("total_frames", -1))
+
+    ep_df = episodes_df.sort_values("episode_index").reset_index(drop=True)
+    ep_count = len(ep_df)
+    if expected_eps != -1 and ep_count != expected_eps:
+        issues.append(f"info.total_episodes={expected_eps} but episodes rows={ep_count}.")
+    if expected_frames != -1 and len(data_df) != expected_frames:
+        issues.append(f"info.total_frames={expected_frames} but data rows={len(data_df)}.")
+
+    # Episode index continuity
+    if ep_count > 0:
+        expected_indices = list(range(ep_count))
+        actual_indices = ep_df["episode_index"].astype(int).tolist()
+        if actual_indices != expected_indices:
+            issues.append("episode_index is not contiguous from 0..N-1 in meta/episodes.")
+
+    # Data-frame level checks
+    if len(data_df) > 0:
+        d = data_df.copy()
+        d["episode_index"] = d["episode_index"].astype(int)
+        d["frame_index"] = d["frame_index"].astype(int)
+        d["index"] = d["index"].astype(int)
+        by_ep = d.groupby("episode_index")
+        lengths = by_ep.size().to_dict()
+
+        # Global index continuity
+        idx_sorted = sorted(d["index"].tolist())
+        if idx_sorted != list(range(len(d))):
+            issues.append("data.index is not contiguous from 0..num_frames-1.")
+
+        for _, row in ep_df.iterrows():
+            ep = int(row["episode_index"])
+            length = int(row.get("length", -1))
+            df_from = int(row.get("dataset_from_index", -1))
+            df_to = int(row.get("dataset_to_index", -1))
+            data_len = int(lengths.get(ep, 0))
+
+            if length != data_len:
+                issues.append(f"episode {ep}: length={length} but data rows={data_len}.")
+            if df_to - df_from != data_len:
+                issues.append(
+                    f"episode {ep}: dataset_to-from={df_to - df_from} but data rows={data_len}."
+                )
+            if data_len > 0:
+                ep_rows = d[d["episode_index"] == ep].sort_values("frame_index")
+                fidx = ep_rows["frame_index"].tolist()
+                if fidx != list(range(data_len)):
+                    issues.append(f"episode {ep}: frame_index is not contiguous 0..len-1.")
+                min_global = int(ep_rows["index"].min())
+                max_global = int(ep_rows["index"].max()) + 1
+                if min_global != df_from or max_global != df_to:
+                    issues.append(
+                        f"episode {ep}: dataset_from/to mismatch global index range [{min_global},{max_global})."
+                    )
+
+    # Video metadata checks (shared mp4 chunk case)
+    video_keys = [k for k, ft in info.get("features", {}).items() if ft.get("dtype") in ("video", "image")]
+    for cam in video_keys:
+        from_key = f"videos/{cam}/from_timestamp"
+        to_key = f"videos/{cam}/to_timestamp"
+        file_key = f"videos/{cam}/file_index"
+        chunk_key = f"videos/{cam}/chunk_index"
+        if from_key not in ep_df.columns or to_key not in ep_df.columns:
+            continue
+
+        cam_rows = ep_df[["episode_index", from_key, to_key, file_key, chunk_key]].copy()
+        cam_rows = cam_rows.sort_values("episode_index")
+        prev_to = None
+        prev_file = None
+        prev_chunk = None
+        for _, r in cam_rows.iterrows():
+            ep = int(r["episode_index"])
+            fr = float(r[from_key])
+            to = float(r[to_key])
+            file_idx = int(r[file_key])
+            chunk_idx = int(r[chunk_key])
+            if to <= fr:
+                issues.append(f"{cam} episode {ep}: to_timestamp <= from_timestamp ({to} <= {fr}).")
+
+            # Duration sanity check against fps
+            expected_dur = max((int(ep_df.loc[ep_df["episode_index"] == ep, "length"].iloc[0]) - 1) / max(fps, 1), 0)
+            actual_dur = to - fr
+            if abs(actual_dur - expected_dur) > 1.0:
+                warnings.append(
+                    f"{cam} episode {ep}: duration mismatch (actual={actual_dur:.3f}s, expected~={expected_dur:.3f}s)."
+                )
+
+            # If same physical mp4 segment, boundaries should chain
+            if prev_to is not None and prev_file == file_idx and prev_chunk == chunk_idx:
+                if abs(fr - prev_to) > 0.2:
+                    warnings.append(
+                        f"{cam} episode {ep}: from_timestamp not contiguous with previous episode ({fr:.3f} vs {prev_to:.3f})."
+                    )
+            prev_to = to
+            prev_file = file_idx
+            prev_chunk = chunk_idx
+
+    return {
+        "ok": len(issues) == 0,
+        "repo_id": repo_id,
+        "path": str(root),
+        "summary": {
+            "episodes_meta_rows": len(ep_df),
+            "frames_data_rows": len(data_df),
+            "info_total_episodes": expected_eps,
+            "info_total_frames": expected_frames,
+            "fps": fps,
+        },
+        "issues": issues,
+        "warnings": warnings,
+    }
 
 
 def _rebuild_after_edit(
@@ -489,7 +646,7 @@ def _build_train_command(payload: dict) -> list[str]:
         f"--policy.type={policy_type}",
         f"--output_dir={output_dir}",
         f"--job_name={job_name}",
-        f"--device={device}",
+        f"--policy.device={device}",
     ]
 
     if payload.get("train_mode", "standard") == "peft":
@@ -544,7 +701,7 @@ def _build_run_command(payload: dict) -> list[str]:
         f"--robot.port={robot_port}",
         f"--robot.id={payload['robot_id']}",
         f"--robot.cameras={cameras_json}",
-        f"--control.policy.path={policy_path}",
+        f"--policy.path={policy_path}",
         "--dataset.single_task=web_policy_run",
         f"--dataset.num_episodes={payload.get('num_episodes', 5)}",
         f"--dataset.episode_time_s={payload.get('episode_time_s', 30)}",
@@ -586,12 +743,56 @@ class ApiHandler(SimpleHTTPRequestHandler):
             ctype = "application/json; charset=utf-8"
         else:
             ctype = "application/octet-stream"
-        data = path.read_bytes()
+        file_size = path.stat().st_size
+        range_header = self.headers.get("Range")
+
+        if range_header and range_header.startswith("bytes="):
+            try:
+                range_spec = range_header.split("=", 1)[1].strip()
+                start_str, end_str = range_spec.split("-", 1)
+                start = int(start_str) if start_str else 0
+                end = int(end_str) if end_str else (file_size - 1)
+                if start < 0 or end < start or start >= file_size:
+                    raise ValueError("invalid range")
+                end = min(end, file_size - 1)
+                length = end - start + 1
+
+                self.send_response(206)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+                self.send_header("Content-Length", str(length))
+                self.end_headers()
+
+                with open(path, "rb") as f:
+                    f.seek(start)
+                    remaining = length
+                    chunk_size = 1024 * 1024
+                    while remaining > 0:
+                        chunk = f.read(min(chunk_size, remaining))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
+                return
+            except Exception:  # noqa: BLE001
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{file_size}")
+                self.end_headers()
+                return
+
         self.send_response(200)
         self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(file_size))
         self.end_headers()
-        self.wfile.write(data)
+        with open(path, "rb") as f:
+            chunk_size = 1024 * 1024
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
 
     def _handle_api_get(self, path: str):
         parsed = urlparse(self.path)
@@ -647,6 +848,15 @@ class ApiHandler(SimpleHTTPRequestHandler):
                     }
                 )
             return self._send_json(rows)
+
+        if path == "/api/dataset/check-integrity":
+            repo_id = query.get("repo_id", [None])[0]
+            if not repo_id:
+                return self._send_json({"error": "repo_id is required"}, status=400)
+            try:
+                return self._send_json(_check_dataset_integrity(repo_id))
+            except Exception as exc:  # noqa: BLE001
+                return self._send_json({"ok": False, "error": str(exc)}, status=500)
 
         if path == "/api/files":
             p = query.get("path", [None])[0]
@@ -801,8 +1011,26 @@ class ApiHandler(SimpleHTTPRequestHandler):
         return self._send_json({"error": "task not found"}, status=404)
 
     def do_DELETE(self):
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
+        query = parse_qs(parsed.query)
         if not path.startswith("/api/tasks/"):
+            if path == "/api/datasets/path":
+                p = query.get("path", [None])[0]
+                if not p:
+                    return self._send_json({"error": "path is required"}, status=400)
+                target = Path(p).resolve()
+                if not target.exists():
+                    return self._send_json({"ok": True, "deleted": False, "reason": "not_found"})
+                try:
+                    _validate_deletable_path(target)
+                    if target.is_dir():
+                        shutil.rmtree(target)
+                    else:
+                        target.unlink()
+                    return self._send_json({"ok": True, "deleted": True, "path": str(target)})
+                except Exception as exc:  # noqa: BLE001
+                    return self._send_json({"error": str(exc)}, status=400)
             return self._not_found()
 
         task_id = path.split("/")[-1]

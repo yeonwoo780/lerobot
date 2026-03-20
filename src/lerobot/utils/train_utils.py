@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import shutil
 from pathlib import Path
 
 from torch.optim import Optimizer
@@ -56,10 +57,21 @@ def load_training_step(save_dir: Path) -> int:
 
 def update_last_checkpoint(checkpoint_dir: Path) -> Path:
     last_checkpoint_dir = checkpoint_dir.parent / LAST_CHECKPOINT_LINK
-    if last_checkpoint_dir.is_symlink():
-        last_checkpoint_dir.unlink()
+    if last_checkpoint_dir.exists() or last_checkpoint_dir.is_symlink():
+        if last_checkpoint_dir.is_symlink() or last_checkpoint_dir.is_file():
+            last_checkpoint_dir.unlink()
+        else:
+            shutil.rmtree(last_checkpoint_dir)
+
     relative_target = checkpoint_dir.relative_to(checkpoint_dir.parent)
-    last_checkpoint_dir.symlink_to(relative_target)
+    try:
+        last_checkpoint_dir.symlink_to(relative_target)
+    except OSError:
+        # Windows often blocks symlink creation without elevated privilege/dev mode.
+        # Fallback to a real directory copy so "checkpoints/last" remains usable.
+        shutil.copytree(checkpoint_dir, last_checkpoint_dir)
+
+    return last_checkpoint_dir
 
 
 def save_checkpoint(

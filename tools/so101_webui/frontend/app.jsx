@@ -1,4 +1,4 @@
-const { useEffect, useMemo, useState } = React;
+﻿const { useEffect, useMemo, useRef, useState } = React;
 
 const defaultForm = {
   name: "",
@@ -56,8 +56,10 @@ function App() {
   const [episodes, setEpisodes] = useState([]);
   const [selectedEpisodeIdx, setSelectedEpisodeIdx] = useState(null);
   const [episodeTaskDrafts, setEpisodeTaskDrafts] = useState({});
+  const [integrityReport, setIntegrityReport] = useState(null);
 
   const [cameraRaw, setCameraRaw] = useState("");
+  const jobListRef = useRef(null);
 
   const selectedTask = useMemo(() => tasks.find((t) => t.id === selectedId) || null, [tasks, selectedId]);
   const selectedPreset = useMemo(() => meta.presets.find((p) => p.id === presetId), [meta, presetId]);
@@ -65,6 +67,15 @@ function App() {
     () => episodes.find((e) => e.episode_index === selectedEpisodeIdx) || null,
     [episodes, selectedEpisodeIdx]
   );
+
+  function buildEpisodeVideoSrc(v, epIdx) {
+    const base = `/api/files?path=${encodeURIComponent(v.path)}&ep=${encodeURIComponent(String(epIdx))}&cam=${encodeURIComponent(String(v.camera))}`;
+    const start = Number(v.start_s || 0);
+    if (v.end_s != null) {
+      return `${base}#t=${start},${Number(v.end_s)}`;
+    }
+    return `${base}#t=${start}`;
+  }
 
   async function api(path, options = {}) {
     const res = await fetch(path, {
@@ -93,6 +104,12 @@ function App() {
     const timer = setInterval(() => api("/api/jobs").then(setJobs).catch(() => {}), 3000);
     return () => clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    const el = jobListRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [jobs]);
 
   function updateForm(patch) {
     setForm((prev) => ({ ...prev, ...patch }));
@@ -165,18 +182,28 @@ function App() {
       alert("teleop_port를 입력하세요.");
       return false;
     }
-    if (kind === "run" && !String(form.policy_path || "").trim()) {
-      alert("policy_path를 입력하세요.");
-      return false;
-    }
     return true;
   }
 
   async function startAction(kind) {
     if (!ensureActionInputs(kind)) return;
 
+    let policyPath = String(form.policy_path || "").trim();
+    if (kind === "run" && !policyPath) {
+      const latest = [...datasets]
+        .filter((d) => String(d.path || "").includes("checkpoints") && String(d.path || "").includes("pretrained_model"))
+        .sort((a, b) => String(b.updated_at || "").localeCompare(String(a.updated_at || "")))[0];
+      if (!latest?.path) {
+        alert("policy_path를 입력하세요.");
+        return;
+      }
+      policyPath = latest.path;
+      updateForm({ policy_path: latest.path });
+    }
+
     const payload = {
       ...form,
+      policy_path: kind === "run" ? policyPath : form.policy_path,
       fps: Number(form.fps),
       episode_time_s: Number(form.episode_time_s),
       num_episodes: Number(form.num_episodes),
@@ -202,6 +229,19 @@ function App() {
 
   async function stopJob(jobId) {
     await api(`/api/jobs/${jobId}/stop`, { method: "POST" });
+    await refreshAll();
+  }
+
+  function useAsPolicyPath(path) {
+    if (!path) return;
+    updateForm({ policy_path: path });
+    setLastCommand(`policy_path set: ${path}`);
+  }
+
+  async function deleteDatasetPath(path) {
+    if (!path) return;
+    if (!confirm(`해당 경로를 삭제할까요?\n${path}`)) return;
+    await api(`/api/datasets/path?path=${encodeURIComponent(path)}`, { method: "DELETE" });
     await refreshAll();
   }
 
@@ -240,6 +280,15 @@ function App() {
     } else {
       setSelectedEpisodeIdx(null);
     }
+  }
+
+  async function checkDatasetIntegrity() {
+    if (!datasetRepoId) {
+      alert("repo_id를 먼저 입력하세요.");
+      return;
+    }
+    const report = await api(`/api/dataset/check-integrity?repo_id=${encodeURIComponent(datasetRepoId)}`);
+    setIntegrityReport(report);
   }
 
   async function updateEpisodeTask(episodeIndex) {
@@ -282,24 +331,53 @@ function App() {
             <label>Num Episodes<input type="number" value={form.num_episodes} onChange={(e) => updateForm({ num_episodes: e.target.value })} /></label>
             <label>Policy Type
               <select value={form.policy_type} onChange={(e) => updateForm({ policy_type: e.target.value })}>
-                <option value="act">act</option><option value="diffusion">diffusion</option><option value="vqbet">vqbet</option><option value="pi0">pi0</option><option value="smolvla">smolvla</option>
+                <option value="act">act</option>
+                <option value="diffusion">diffusion</option>
+                <option value="vqbet">vqbet</option>
+                <option value="pi0">pi0</option>
+                <option value="smolvla">smolvla</option>
               </select>
             </label>
-            <label>Device<select value={form.device} onChange={(e) => updateForm({ device: e.target.value })}><option value="cuda">cuda</option><option value="cpu">cpu</option></select></label>
+            <label>Device
+              <select value={form.device} onChange={(e) => updateForm({ device: e.target.value })}>
+                <option value="cuda">cuda</option>
+                <option value="cpu">cpu</option>
+              </select>
+            </label>
             <label>Policy Path<input value={form.policy_path} onChange={(e) => updateForm({ policy_path: e.target.value })} /></label>
           </div>
 
           <h2 style={{ marginTop: 12 }}>카메라 설정 (top/front)</h2>
           <div className="form-grid">
-            <label>Top 사용<select value={String(form.top_camera_enabled)} onChange={(e) => updateForm({ top_camera_enabled: e.target.value === "true" })}><option value="true">true</option><option value="false">false</option></select></label>
-            <label>Top Type<select value={form.top_camera_type} onChange={(e) => updateForm({ top_camera_type: e.target.value })}><option value="opencv">opencv</option><option value="realsense">realsense</option></select></label>
+            <label>Top 사용
+              <select value={String(form.top_camera_enabled)} onChange={(e) => updateForm({ top_camera_enabled: e.target.value === "true" })}>
+                <option value="true">true</option>
+                <option value="false">false</option>
+              </select>
+            </label>
+            <label>Top Type
+              <select value={form.top_camera_type} onChange={(e) => updateForm({ top_camera_type: e.target.value })}>
+                <option value="opencv">opencv</option>
+                <option value="realsense">realsense</option>
+              </select>
+            </label>
             <label>Top Index/Path<input value={form.top_camera_index_or_path} onChange={(e) => updateForm({ top_camera_index_or_path: e.target.value })} /></label>
             <label>Top W<input type="number" value={form.top_camera_width} onChange={(e) => updateForm({ top_camera_width: e.target.value })} /></label>
             <label>Top H<input type="number" value={form.top_camera_height} onChange={(e) => updateForm({ top_camera_height: e.target.value })} /></label>
             <label>Top FPS<input type="number" value={form.top_camera_fps} onChange={(e) => updateForm({ top_camera_fps: e.target.value })} /></label>
 
-            <label>Front 사용<select value={String(form.front_camera_enabled)} onChange={(e) => updateForm({ front_camera_enabled: e.target.value === "true" })}><option value="true">true</option><option value="false">false</option></select></label>
-            <label>Front Type<select value={form.front_camera_type} onChange={(e) => updateForm({ front_camera_type: e.target.value })}><option value="opencv">opencv</option><option value="realsense">realsense</option></select></label>
+            <label>Front 사용
+              <select value={String(form.front_camera_enabled)} onChange={(e) => updateForm({ front_camera_enabled: e.target.value === "true" })}>
+                <option value="true">true</option>
+                <option value="false">false</option>
+              </select>
+            </label>
+            <label>Front Type
+              <select value={form.front_camera_type} onChange={(e) => updateForm({ front_camera_type: e.target.value })}>
+                <option value="opencv">opencv</option>
+                <option value="realsense">realsense</option>
+              </select>
+            </label>
             <label>Front Index/Path<input value={form.front_camera_index_or_path} onChange={(e) => updateForm({ front_camera_index_or_path: e.target.value })} /></label>
             <label>Front W<input type="number" value={form.front_camera_width} onChange={(e) => updateForm({ front_camera_width: e.target.value })} /></label>
             <label>Front H<input type="number" value={form.front_camera_height} onChange={(e) => updateForm({ front_camera_height: e.target.value })} /></label>
@@ -375,6 +453,8 @@ function App() {
           <button onClick={() => startAction("train")}>학습 시작</button>
 
           <label style={{ marginTop: 8 }}>Run 추가 인자<textarea value={form.run_extra_args} onChange={(e) => updateForm({ run_extra_args: e.target.value })} /></label>
+          <div className="meta">Run 추가 인자 샘플</div>
+          <pre>{"--display_data=true\n--dataset.num_episodes=3 --dataset.episode_time_s=20\n--policy.device=cuda --policy.use_amp=true"}</pre>
           <button onClick={() => startAction("run")}>학습 모델 실행</button>
 
           {lastCommand && <><div className="meta" style={{ marginTop: 8 }}>마지막 실행 명령</div><pre>{lastCommand}</pre></>}
@@ -389,6 +469,12 @@ function App() {
                 <div className="meta">repo_id: {d.repo_id || "(local only)"}</div>
                 <div className="meta">path: {d.path}</div>
                 <div className="meta">updated: {d.updated_at}</div>
+                <div className="row" style={{ marginTop: 8 }}>
+                  {String(d.path || "").includes("pretrained_model") && (
+                    <button className="secondary" onClick={() => useAsPolicyPath(d.path)}>Run 경로로 사용</button>
+                  )}
+                  <button className="danger" onClick={() => deleteDatasetPath(d.path)}>삭제</button>
+                </div>
               </div>
             ))}
           </div>
@@ -401,7 +487,7 @@ function App() {
     return (
       <section className="panel" style={{ marginTop: 14 }}>
         <h2>Job 로그</h2>
-        <div className="job-list">
+        <div className="job-list" ref={jobListRef}>
           {jobs.map((j) => (
             <div key={j.id} className="card">
               <div className="row">
@@ -426,7 +512,25 @@ function App() {
           <div className="row">
             <input value={datasetRepoId} onChange={(e) => setDatasetRepoId(e.target.value)} placeholder="repo_id (user/so101_task)" />
             <button className="secondary" onClick={() => loadEpisodes(datasetRepoId)}>불러오기</button>
+            <button className="secondary" onClick={checkDatasetIntegrity}>무결성 체크</button>
           </div>
+
+          {integrityReport && (
+            <div className="card" style={{ marginTop: 8 }}>
+              <div className="meta">integrity: {integrityReport.ok ? "OK" : "FAIL"}</div>
+              {integrityReport.summary && (
+                <div className="meta">
+                  episodes={integrityReport.summary.episodes_meta_rows}, frames={integrityReport.summary.frames_data_rows}, fps={integrityReport.summary.fps}
+                </div>
+              )}
+              {(integrityReport.issues || []).map((x, i) => (
+                <div key={`issue-${i}`} className="meta" style={{ color: "#bf1d28" }}>- {x}</div>
+              ))}
+              {(integrityReport.warnings || []).map((x, i) => (
+                <div key={`warn-${i}`} className="meta" style={{ color: "#905100" }}>- {x}</div>
+              ))}
+            </div>
+          )}
 
           <h2 style={{ marginTop: 12 }}>Episodes</h2>
           <div className="episode-list">
@@ -467,9 +571,15 @@ function App() {
                   <video
                     controls
                     style={{ width: "100%", maxHeight: "420px", borderRadius: "8px", border: "1px solid #d8e3f0" }}
-                    src={`/api/files?path=${encodeURIComponent(v.path)}`}
+                    src={buildEpisodeVideoSrc(v, selectedEpisode.episode_index)}
                     onLoadedMetadata={(e) => {
                       try { e.currentTarget.currentTime = Number(v.start_s || 0); } catch (_) {}
+                    }}
+                    onTimeUpdate={(e) => {
+                      if (v.end_s == null) return;
+                      if (e.currentTarget.currentTime >= Number(v.end_s)) {
+                        e.currentTarget.pause();
+                      }
                     }}
                   />
                 </div>
