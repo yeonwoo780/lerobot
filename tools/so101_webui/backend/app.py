@@ -508,6 +508,37 @@ def _write_tasks(tasks: list[dict]) -> None:
     TASKS_FILE.write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _merge_cli_args(base_cmd: list[str], override_args: str) -> list[str]:
+    """
+    Merge '--key=value' style overrides into an existing command list.
+    If the same key exists in base_cmd, replace it; otherwise append.
+    Non '--key=value' tokens are appended as-is.
+    """
+    text = str(override_args or "").strip()
+    if not text:
+        return base_cmd
+
+    merged = list(base_cmd)
+    key_to_index: dict[str, int] = {}
+    for i, tok in enumerate(merged):
+        if tok.startswith("--") and "=" in tok:
+            key = tok.split("=", 1)[0]
+            key_to_index[key] = i
+
+    for tok in shlex.split(text, posix=False):
+        if tok.startswith("--") and "=" in tok:
+            key = tok.split("=", 1)[0]
+            if key in key_to_index:
+                merged[key_to_index[key]] = tok
+            else:
+                key_to_index[key] = len(merged)
+                merged.append(tok)
+        else:
+            merged.append(tok)
+
+    return merged
+
+
 def _run_command(name: str, command: list[str]) -> Job:
     job_id = str(uuid.uuid4())
     job = Job(id=job_id, name=name, command=command, created_at=time.time())
@@ -602,6 +633,14 @@ def _build_record_command(payload: dict) -> list[str]:
             "height": int(payload.get("front_camera_height", 480)),
             "fps": int(payload.get("front_camera_fps", 30)),
         }
+    if payload.get("wrist_camera_enabled", False):
+        cameras["wrist"] = {
+            "type": payload.get("wrist_camera_type", "opencv"),
+            "index_or_path": payload.get("wrist_camera_index_or_path", 2),
+            "width": int(payload.get("wrist_camera_width", 640)),
+            "height": int(payload.get("wrist_camera_height", 480)),
+            "fps": int(payload.get("wrist_camera_fps", 30)),
+        }
     cameras_json = json.dumps(cameras, ensure_ascii=False)
 
     resume_flag = bool(payload.get("record_append", False))
@@ -625,10 +664,7 @@ def _build_record_command(payload: dict) -> list[str]:
         f"--dataset.fps={payload.get('fps', 30)}",
         f"--resume={str(resume_flag).lower()}",
     ]
-    extra = str(payload.get("extra_args", "")).strip()
-    if extra:
-        cmd.extend(shlex.split(extra, posix=False))
-    return cmd
+    return _merge_cli_args(cmd, str(payload.get("extra_args", "")))
 
 
 def _build_train_command(payload: dict) -> list[str]:
@@ -654,10 +690,7 @@ def _build_train_command(payload: dict) -> list[str]:
         if peft_args:
             cmd.extend(shlex.split(peft_args, posix=False))
 
-    extra = str(payload.get("extra_args", "")).strip()
-    if extra:
-        cmd.extend(shlex.split(extra, posix=False))
-    return cmd
+    return _merge_cli_args(cmd, str(payload.get("extra_args", "")))
 
 
 def _build_run_command(payload: dict) -> list[str]:
@@ -688,11 +721,25 @@ def _build_run_command(payload: dict) -> list[str]:
             "height": int(payload.get("front_camera_height", 480)),
             "fps": int(payload.get("front_camera_fps", 30)),
         }
+    if payload.get("wrist_camera_enabled", False):
+        cameras["wrist"] = {
+            "type": payload.get("wrist_camera_type", "opencv"),
+            "index_or_path": payload.get("wrist_camera_index_or_path", 2),
+            "width": int(payload.get("wrist_camera_width", 640)),
+            "height": int(payload.get("wrist_camera_height", 480)),
+            "fps": int(payload.get("wrist_camera_fps", 30)),
+        }
     cameras_json = json.dumps(cameras, ensure_ascii=False)
 
     resume_flag = bool(payload.get("record_append", False))
     if resume_flag and not _local_dataset_exists(dataset_repo_id):
         resume_flag = False
+
+    single_task = (
+        str(payload.get("single_task", "")).strip()
+        or str(payload.get("name", "")).strip()
+        or "web_policy_run"
+    )
 
     cmd = [
         "lerobot-record",
@@ -702,16 +749,13 @@ def _build_run_command(payload: dict) -> list[str]:
         f"--robot.id={payload['robot_id']}",
         f"--robot.cameras={cameras_json}",
         f"--policy.path={policy_path}",
-        "--dataset.single_task=web_policy_run",
+        f"--dataset.single_task={single_task}",
         f"--dataset.num_episodes={payload.get('num_episodes', 5)}",
         f"--dataset.episode_time_s={payload.get('episode_time_s', 30)}",
         f"--dataset.fps={payload.get('fps', 30)}",
         f"--resume={str(resume_flag).lower()}",
     ]
-    extra = str(payload.get("extra_args", "")).strip()
-    if extra:
-        cmd.extend(shlex.split(extra, posix=False))
-    return cmd
+    return _merge_cli_args(cmd, str(payload.get("extra_args", "")))
 
 
 class ApiHandler(SimpleHTTPRequestHandler):
@@ -878,7 +922,8 @@ class ApiHandler(SimpleHTTPRequestHandler):
                         "command": j.command,
                         "log_tail": j.logs[-120:],
                     }
-                    for j in sorted(JOBS.values(), key=lambda x: x.created_at, reverse=True)
+                    for j in sorted(JOBS.values(), key=lambda x: x.created_at)
+                    if j.status != "success"
                 ]
             return self._send_json(out)
 

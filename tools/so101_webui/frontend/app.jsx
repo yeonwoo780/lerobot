@@ -2,6 +2,7 @@
 
 const defaultForm = {
   name: "",
+  single_task: "",
   dataset_repo_id: "",
   robot_port: "",
   teleop_port: "",
@@ -15,7 +16,7 @@ const defaultForm = {
   peft_args: "",
   train_extra_args: "",
   record_extra_args: "",
-  run_extra_args: "",
+  run_args: "",
   policy_path: "",
   record_append: false,
 
@@ -32,6 +33,13 @@ const defaultForm = {
   front_camera_width: 640,
   front_camera_height: 480,
   front_camera_fps: 30,
+
+  wrist_camera_enabled: false,
+  wrist_camera_type: "opencv",
+  wrist_camera_index_or_path: "2",
+  wrist_camera_width: 640,
+  wrist_camera_height: 480,
+  wrist_camera_fps: 30,
 };
 
 function App() {
@@ -122,7 +130,7 @@ function App() {
       ...t,
       train_extra_args: t.train_extra_args || "",
       record_extra_args: t.record_extra_args || "",
-      run_extra_args: t.run_extra_args || "",
+      run_args: t.run_args || t.run_extra_args || "",
       peft_args: t.peft_args || "",
     });
     if (t.dataset_repo_id) setDatasetRepoId(t.dataset_repo_id);
@@ -145,6 +153,9 @@ function App() {
       front_camera_width: Number(form.front_camera_width),
       front_camera_height: Number(form.front_camera_height),
       front_camera_fps: Number(form.front_camera_fps),
+      wrist_camera_width: Number(form.wrist_camera_width),
+      wrist_camera_height: Number(form.wrist_camera_height),
+      wrist_camera_fps: Number(form.wrist_camera_fps),
     };
 
     if (!body.name || !body.dataset_repo_id) {
@@ -213,6 +224,9 @@ function App() {
       front_camera_width: Number(form.front_camera_width),
       front_camera_height: Number(form.front_camera_height),
       front_camera_fps: Number(form.front_camera_fps),
+      wrist_camera_width: Number(form.wrist_camera_width),
+      wrist_camera_height: Number(form.wrist_camera_height),
+      wrist_camera_fps: Number(form.wrist_camera_fps),
     };
 
     if (kind === "train") {
@@ -220,7 +234,7 @@ function App() {
       payload.extra_args = form.train_extra_args || "";
     }
     if (kind === "record") payload.extra_args = form.record_extra_args || "";
-    if (kind === "run") payload.extra_args = form.run_extra_args || "";
+    if (kind === "run") payload.extra_args = form.run_args || "";
 
     const res = await api(`/api/actions/${kind}`, { method: "POST", body: JSON.stringify(payload) });
     setLastCommand(res.command.join(" "));
@@ -234,7 +248,14 @@ function App() {
 
   function useAsPolicyPath(path) {
     if (!path) return;
-    updateForm({ policy_path: path });
+    const quotedPath = String(path).includes(" ") ? `"${path}"` : String(path);
+    const policyArg = `--policy.path=${quotedPath}`;
+    const currentExtra = String(form.run_args || "").trim();
+    const nextExtra = /--policy\.path=(?:"[^"]*"|'[^']*'|\S+)/.test(currentExtra)
+      ? currentExtra.replace(/--policy\.path=(?:"[^"]*"|'[^']*'|\S+)/, policyArg)
+      : `${currentExtra} ${policyArg}`.trim();
+
+    updateForm({ policy_path: path, run_args: nextExtra });
     setLastCommand(`policy_path set: ${path}`);
   }
 
@@ -321,6 +342,7 @@ function App() {
           <h2>Task 설정</h2>
           <div className="form-grid">
             <label>Task 이름<input value={form.name} onChange={(e) => updateForm({ name: e.target.value })} /></label>
+            <label>Single Task Prompt<input value={form.single_task} onChange={(e) => updateForm({ single_task: e.target.value })} placeholder="예: Grasp a lego block and put it in the bin." /></label>
             <label>Dataset Repo ID<input value={form.dataset_repo_id} onChange={(e) => updateForm({ dataset_repo_id: e.target.value })} /></label>
             <label>Robot Port<input value={form.robot_port} onChange={(e) => updateForm({ robot_port: e.target.value })} /></label>
             <label>Teleop Port<input value={form.teleop_port} onChange={(e) => updateForm({ teleop_port: e.target.value })} /></label>
@@ -347,7 +369,7 @@ function App() {
             <label>Policy Path<input value={form.policy_path} onChange={(e) => updateForm({ policy_path: e.target.value })} /></label>
           </div>
 
-          <h2 style={{ marginTop: 12 }}>카메라 설정 (top/front)</h2>
+          <h2 style={{ marginTop: 12 }}>카메라 설정 (top/front/wrist)</h2>
           <div className="form-grid">
             <label>Top 사용
               <select value={String(form.top_camera_enabled)} onChange={(e) => updateForm({ top_camera_enabled: e.target.value === "true" })}>
@@ -382,6 +404,23 @@ function App() {
             <label>Front W<input type="number" value={form.front_camera_width} onChange={(e) => updateForm({ front_camera_width: e.target.value })} /></label>
             <label>Front H<input type="number" value={form.front_camera_height} onChange={(e) => updateForm({ front_camera_height: e.target.value })} /></label>
             <label>Front FPS<input type="number" value={form.front_camera_fps} onChange={(e) => updateForm({ front_camera_fps: e.target.value })} /></label>
+
+            <label>Wrist 사용
+              <select value={String(form.wrist_camera_enabled)} onChange={(e) => updateForm({ wrist_camera_enabled: e.target.value === "true" })}>
+                <option value="true">true</option>
+                <option value="false">false</option>
+              </select>
+            </label>
+            <label>Wrist Type
+              <select value={form.wrist_camera_type} onChange={(e) => updateForm({ wrist_camera_type: e.target.value })}>
+                <option value="opencv">opencv</option>
+                <option value="realsense">realsense</option>
+              </select>
+            </label>
+            <label>Wrist Index/Path<input value={form.wrist_camera_index_or_path} onChange={(e) => updateForm({ wrist_camera_index_or_path: e.target.value })} /></label>
+            <label>Wrist W<input type="number" value={form.wrist_camera_width} onChange={(e) => updateForm({ wrist_camera_width: e.target.value })} /></label>
+            <label>Wrist H<input type="number" value={form.wrist_camera_height} onChange={(e) => updateForm({ wrist_camera_height: e.target.value })} /></label>
+            <label>Wrist FPS<input type="number" value={form.wrist_camera_fps} onChange={(e) => updateForm({ wrist_camera_fps: e.target.value })} /></label>
           </div>
 
           <div className="row" style={{ marginTop: 10 }}>
@@ -452,8 +491,8 @@ function App() {
           <label>Train 추가 인자<textarea value={form.train_extra_args} onChange={(e) => updateForm({ train_extra_args: e.target.value })} /></label>
           <button onClick={() => startAction("train")}>학습 시작</button>
 
-          <label style={{ marginTop: 8 }}>Run 추가 인자<textarea value={form.run_extra_args} onChange={(e) => updateForm({ run_extra_args: e.target.value })} /></label>
-          <div className="meta">Run 추가 인자 샘플</div>
+          <label style={{ marginTop: 8 }}>Run 인자<textarea value={form.run_args} onChange={(e) => updateForm({ run_args: e.target.value })} /></label>
+          <div className="meta">Run 인자 샘플</div>
           <pre>{"--display_data=true\n--dataset.num_episodes=3 --dataset.episode_time_s=20\n--policy.device=cuda --policy.use_amp=true"}</pre>
           <button onClick={() => startAction("run")}>학습 모델 실행</button>
 
