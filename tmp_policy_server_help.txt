@@ -1,0 +1,21 @@
+﻿usage: policy_server.py [-h] [--config_path str] [--host str] [--port int]
+                        [--fps int] [--inference_latency float]
+                        [--obs_queue_timeout float]
+
+options:
+  -h, --help            show this help message and exit
+  --config_path str     Path for a config file to parse with draccus (default:
+                        None)
+
+PolicyServerConfig:
+  Configuration for PolicyServer.
+  
+      This class defines all configurable parameters for the PolicyServer,
+      including networking settings and action chunking specifications.
+      
+
+  --host str            Networking configuration (default: localhost)
+  --port int            
+  --fps int             Timing configuration (default: 30)
+  --inference_latency float
+  --obs_queue_timeout float

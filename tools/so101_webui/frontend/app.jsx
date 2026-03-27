@@ -18,6 +18,18 @@ const defaultForm = {
   train_args: "--batch_size=8 --steps=60000 --save_freq=10000 --eval_freq=0 --num_workers=4 --policy.push_to_hub=false",
   record_args: "--dataset.single_task=web_collected_task --dataset.num_episodes=20 --dataset.episode_time_s=30 --dataset.reset_time_s=5 --dataset.fps=30 --resume=false",
   run_args: "",
+  async_server_args: "--fps=30 --inference_latency=0.1 --obs_queue_timeout=1.0",
+  async_client_args: "",
+  async_server_host: "127.0.0.1",
+  async_server_port: 8080,
+  async_server_address: "127.0.0.1:8080",
+  async_policy_type: "act",
+  async_pretrained_name_or_path: "",
+  async_policy_device: "cuda",
+  async_actions_per_chunk: 200,
+  async_chunk_size_threshold: 0.7,
+  async_verify_robot_cameras: true,
+  async_task: "",
   policy_path: "",
   record_append: false,
 
@@ -102,6 +114,8 @@ function App() {
     presets: [],
   });
   const [presetId, setPresetId] = useState("");
+  const [realtimeTaskId, setRealtimeTaskId] = useState("");
+  const [realtimeCheckpointPath, setRealtimeCheckpointPath] = useState("");
 
   const [datasetRepoId, setDatasetRepoId] = useState("");
   const [episodes, setEpisodes] = useState([]);
@@ -117,6 +131,14 @@ function App() {
   const selectedEpisode = useMemo(
     () => episodes.find((e) => e.episode_index === selectedEpisodeIdx) || null,
     [episodes, selectedEpisodeIdx]
+  );
+  const checkpointOptions = useMemo(
+    () => datasets.filter((d) => String(d.path || "").includes("pretrained_model")),
+    [datasets]
+  );
+  const asyncJobs = useMemo(
+    () => jobs.filter((j) => j.name === "async-server" || j.name === "async-client"),
+    [jobs]
   );
 
   function buildEpisodeVideoSrc(v, epIdx) {
@@ -216,6 +238,9 @@ function App() {
       wrist_camera_width: Number(form.wrist_camera_width),
       wrist_camera_height: Number(form.wrist_camera_height),
       wrist_camera_fps: Number(form.wrist_camera_fps),
+      async_server_port: Number(form.async_server_port),
+      async_actions_per_chunk: Number(form.async_actions_per_chunk),
+      async_chunk_size_threshold: Number(form.async_chunk_size_threshold),
     };
 
     if (!body.name || !body.dataset_repo_id) {
@@ -241,16 +266,20 @@ function App() {
   }
 
   function ensureActionInputs(kind) {
-    if (!String(form.dataset_repo_id || "").trim()) {
+    if ((kind === "record" || kind === "train" || kind === "run") && !String(form.dataset_repo_id || "").trim()) {
       alert("dataset_repo_id를 입력하세요. 예: yourname/so101_task");
       return false;
     }
-    if ((kind === "record" || kind === "run") && !String(form.robot_port || "").trim()) {
+    if ((kind === "record" || kind === "run" || kind === "async-client") && !String(form.robot_port || "").trim()) {
       alert("robot_port를 입력하세요.");
       return false;
     }
     if (kind === "record" && !String(form.teleop_port || "").trim()) {
       alert("teleop_port를 입력하세요.");
+      return false;
+    }
+    if (kind === "async-client" && !String(form.async_pretrained_name_or_path || form.policy_path || "").trim()) {
+      alert("async pretrained 경로 또는 policy path를 입력하세요.");
       return false;
     }
     return true;
@@ -265,11 +294,19 @@ function App() {
         .filter((d) => String(d.path || "").includes("checkpoints") && String(d.path || "").includes("pretrained_model"))
         .sort((a, b) => String(b.updated_at || "").localeCompare(String(a.updated_at || "")))[0];
       if (!latest?.path) {
-        alert("policy_path를 입력하세요.");
+      alert("policy_path를 입력하세요.");
         return;
       }
       policyPath = latest.path;
       updateForm({ policy_path: latest.path });
+    }
+    if (kind === "async-client" && !String(form.async_pretrained_name_or_path || "").trim()) {
+      const candidate = policyPath || ([...datasets]
+        .filter((d) => String(d.path || "").includes("checkpoints") && String(d.path || "").includes("pretrained_model"))
+        .sort((a, b) => String(b.updated_at || "").localeCompare(String(a.updated_at || "")))[0]?.path || "");
+      if (candidate) {
+        updateForm({ async_pretrained_name_or_path: candidate, policy_path: policyPath || candidate });
+      }
     }
 
     const payload = {
@@ -288,6 +325,9 @@ function App() {
       wrist_camera_width: Number(form.wrist_camera_width),
       wrist_camera_height: Number(form.wrist_camera_height),
       wrist_camera_fps: Number(form.wrist_camera_fps),
+      async_server_port: Number(form.async_server_port),
+      async_actions_per_chunk: Number(form.async_actions_per_chunk),
+      async_chunk_size_threshold: Number(form.async_chunk_size_threshold),
     };
 
     if (kind === "train") {
@@ -296,6 +336,8 @@ function App() {
     }
     if (kind === "record") payload.extra_args = form.record_args || "";
     if (kind === "run") payload.extra_args = form.run_args || "";
+    if (kind === "async-server") payload.extra_args = form.async_server_args || "";
+    if (kind === "async-client") payload.extra_args = form.async_client_args || "";
 
     const res = await api(`/api/actions/${kind}`, { method: "POST", body: JSON.stringify(payload) });
     setLastCommand(res.command.join(" "));
@@ -318,6 +360,26 @@ function App() {
 
     updateForm({ policy_path: path, run_args: nextExtra });
     setLastCommand(`policy_path set: ${path}`);
+  }
+
+  function applyRealtimeTask(taskId) {
+    if (!taskId) return;
+    const t = tasks.find((x) => x.id === taskId);
+    if (!t) return;
+    loadTask(t);
+    updateForm({
+      async_task: String(t.single_task || "").trim() || String(t.name || "").trim(),
+      async_policy_type: t.policy_type || form.async_policy_type || "act",
+    });
+  }
+
+  function applyRealtimeCheckpoint(path) {
+    if (!path) return;
+    updateForm({
+      policy_path: path,
+      async_pretrained_name_or_path: path,
+    });
+    setLastCommand(`async pretrained set: ${path}`);
   }
 
   async function deleteDatasetPath(path) {
@@ -692,6 +754,71 @@ function App() {
     );
   }
 
+  function renderRealtimePage() {
+    return (
+      <section className="grid">
+        <div className="panel">
+          <h2>실시간 추론 제어</h2>
+          <label>Task 선택
+            <select value={realtimeTaskId} onChange={(e) => { setRealtimeTaskId(e.target.value); applyRealtimeTask(e.target.value); }}>
+              <option value="">선택하세요</option>
+              {tasks.map((t) => <option key={t.id} value={t.id}>{t.name} ({t.dataset_repo_id})</option>)}
+            </select>
+          </label>
+          <label>Checkpoint 선택
+            <select value={realtimeCheckpointPath} onChange={(e) => { setRealtimeCheckpointPath(e.target.value); applyRealtimeCheckpoint(e.target.value); }}>
+              <option value="">선택하세요</option>
+              {checkpointOptions.map((d, i) => <option key={`${d.path}-${i}`} value={d.path}>{d.name} :: {d.path}</option>)}
+            </select>
+          </label>
+          <label>Server Host<input value={form.async_server_host} onChange={(e) => updateForm({ async_server_host: e.target.value })} /></label>
+          <label>Server Port<input type="number" value={form.async_server_port} onChange={(e) => updateForm({ async_server_port: e.target.value })} /></label>
+          <label>Server 인자<textarea value={form.async_server_args} onChange={(e) => updateForm({ async_server_args: e.target.value })} /></label>
+          <div className="row" style={{ marginTop: 8 }}>
+            <button onClick={() => startAction("async-server")}>Policy Server 시작</button>
+          </div>
+
+          <label style={{ marginTop: 10 }}>Server Address<input value={form.async_server_address} onChange={(e) => updateForm({ async_server_address: e.target.value })} placeholder="127.0.0.1:8080" /></label>
+          <label>Async Task<input value={form.async_task} onChange={(e) => updateForm({ async_task: e.target.value })} placeholder="Pick up the eraser and place it in the box." /></label>
+          <label>Policy Type<input value={form.async_policy_type} onChange={(e) => updateForm({ async_policy_type: e.target.value })} /></label>
+          <label>Pretrained Name/Path<input value={form.async_pretrained_name_or_path} onChange={(e) => updateForm({ async_pretrained_name_or_path: e.target.value })} placeholder="hub repo id or local path" /></label>
+          <label>Policy Device<input value={form.async_policy_device} onChange={(e) => updateForm({ async_policy_device: e.target.value })} /></label>
+          <label>Actions Per Chunk<input type="number" value={form.async_actions_per_chunk} onChange={(e) => updateForm({ async_actions_per_chunk: e.target.value })} /></label>
+          <label>Chunk Size Threshold<input type="number" step="0.01" value={form.async_chunk_size_threshold} onChange={(e) => updateForm({ async_chunk_size_threshold: e.target.value })} /></label>
+          <label>Verify Robot Cameras
+            <select value={String(form.async_verify_robot_cameras)} onChange={(e) => updateForm({ async_verify_robot_cameras: e.target.value === "true" })}>
+              <option value="true">true</option>
+              <option value="false">false</option>
+            </select>
+          </label>
+          <label>Client 인자<textarea value={form.async_client_args} onChange={(e) => updateForm({ async_client_args: e.target.value })} /></label>
+          <div className="row" style={{ marginTop: 8 }}>
+            <button onClick={() => startAction("async-client")}>Robot Client 시작</button>
+          </div>
+          {lastCommand && <><div className="meta" style={{ marginTop: 8 }}>마지막 실행 명령</div><pre>{lastCommand}</pre></>}
+        </div>
+
+        <div className="panel">
+          <h2>실시간 추론 로그</h2>
+          <div className="job-list">
+            {asyncJobs.length === 0 && <div className="meta">(no async jobs)</div>}
+            {asyncJobs.map((j) => (
+              <div key={j.id} className="card">
+                <div className="row">
+                  <h3>{j.name}</h3>
+                  <span className={`status ${j.status.split("(")[0]}`}>{j.status}</span>
+                  {j.status === "running" && <button className="danger" onClick={() => stopJob(j.id)}>중지</button>}
+                </div>
+                <div className="meta">cmd: {j.command.join(" ")}</div>
+                <pre>{(j.log_tail || []).join("\n") || "(no logs yet)"}</pre>
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
+    );
+  }
+
   return (
     <div className="page">
       <header className="header">
@@ -703,6 +830,7 @@ function App() {
         <aside className="nav-sidebar panel">
           <button className={`nav-btn ${activePage === "dashboard" ? "active" : ""}`} onClick={() => setActivePage("dashboard")}>Dashboard</button>
           <button className={`nav-btn ${activePage === "visualize" ? "active" : ""}`} onClick={() => setActivePage("visualize")}>Dataset Visualize + Edit</button>
+          <button className={`nav-btn ${activePage === "realtime" ? "active" : ""}`} onClick={() => setActivePage("realtime")}>Realtime Inference</button>
         </aside>
 
         <main className="main-content">
@@ -714,6 +842,7 @@ function App() {
             </>
           )}
           {activePage === "visualize" && renderVisualizePage()}
+          {activePage === "realtime" && renderRealtimePage()}
         </main>
       </div>
     </div>
@@ -721,3 +850,5 @@ function App() {
 }
 
 ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+
+

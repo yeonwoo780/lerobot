@@ -821,9 +821,118 @@ def _build_run_command(payload: dict) -> list[str]:
     return _merge_cli_args(cmd, str(payload.get("extra_args", "")))
 
 
+def _build_async_server_command(payload: dict) -> list[str]:
+    host = str(payload.get("async_server_host", "127.0.0.1")).strip() or "127.0.0.1"
+    port = int(payload.get("async_server_port", 8080))
+    if port <= 0 or port > 65535:
+        raise ValueError("async_server_port must be between 1 and 65535")
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "lerobot.async_inference.policy_server",
+        f"--host={host}",
+        f"--port={port}",
+    ]
+    return _merge_cli_args(cmd, str(payload.get("extra_args", "")))
+
+
+def _build_async_client_command(payload: dict) -> list[str]:
+    robot_port = str(payload.get("robot_port", "")).strip()
+    if not robot_port:
+        raise ValueError("robot_port is required")
+
+    server_host = str(payload.get("async_server_host", "127.0.0.1")).strip() or "127.0.0.1"
+    server_port = int(payload.get("async_server_port", 8080))
+    server_address = (
+        str(payload.get("async_server_address", "")).strip() or f"{server_host}:{server_port}"
+    )
+    policy_type = str(payload.get("async_policy_type", "")).strip() or str(payload.get("policy_type", "act")).strip()
+    if not policy_type:
+        raise ValueError("async_policy_type is required")
+
+    pretrained = (
+        str(payload.get("async_pretrained_name_or_path", "")).strip()
+        or str(payload.get("policy_path", "")).strip()
+    )
+    if not pretrained:
+        raise ValueError("async_pretrained_name_or_path or policy_path is required")
+
+    policy_device = (
+        str(payload.get("async_policy_device", "")).strip()
+        or str(payload.get("device", "cuda")).strip()
+        or "cuda"
+    )
+    actions_per_chunk = int(payload.get("async_actions_per_chunk", 200))
+    chunk_size_threshold = float(payload.get("async_chunk_size_threshold", 0.7))
+    verify_robot_cameras = str(bool(payload.get("async_verify_robot_cameras", True))).lower()
+    task = (
+        str(payload.get("async_task", "")).strip()
+        or str(payload.get("single_task", "")).strip()
+        or str(payload.get("name", "")).strip()
+        or "web_async_task"
+    )
+
+    cameras: dict[str, dict] = {}
+    if payload.get("top_camera_enabled", True):
+        cameras["top"] = {
+            "type": payload.get("top_camera_type", "opencv"),
+            "index_or_path": payload.get("top_camera_index_or_path", 0),
+            "width": int(payload.get("top_camera_width", 640)),
+            "height": int(payload.get("top_camera_height", 480)),
+            "fps": int(payload.get("top_camera_fps", 30)),
+        }
+    if payload.get("front_camera_enabled", True):
+        cameras["front"] = {
+            "type": payload.get("front_camera_type", "opencv"),
+            "index_or_path": payload.get("front_camera_index_or_path", 1),
+            "width": int(payload.get("front_camera_width", 640)),
+            "height": int(payload.get("front_camera_height", 480)),
+            "fps": int(payload.get("front_camera_fps", 30)),
+        }
+    if payload.get("wrist_camera_enabled", False):
+        cameras["wrist"] = {
+            "type": payload.get("wrist_camera_type", "opencv"),
+            "index_or_path": payload.get("wrist_camera_index_or_path", 2),
+            "width": int(payload.get("wrist_camera_width", 640)),
+            "height": int(payload.get("wrist_camera_height", 480)),
+            "fps": int(payload.get("wrist_camera_fps", 30)),
+        }
+    if len(cameras) == 0:
+        raise ValueError("At least one camera must be enabled for async client")
+
+    cameras_json = json.dumps(cameras, ensure_ascii=False)
+    cmd = [
+        sys.executable,
+        "-m",
+        "lerobot.async_inference.robot_client",
+        f"--server_address={server_address}",
+        "--robot.type=so101_follower",
+        f"--robot.port={robot_port}",
+        f"--robot.id={payload.get('robot_id', 'follower')}",
+        f"--robot.cameras={cameras_json}",
+        f"--task={task}",
+        f"--policy_type={policy_type}",
+        f"--pretrained_name_or_path={pretrained}",
+        f"--policy_device={policy_device}",
+        f"--actions_per_chunk={actions_per_chunk}",
+        f"--chunk_size_threshold={chunk_size_threshold}",
+        f"--verify_robot_cameras={verify_robot_cameras}",
+    ]
+    return _merge_cli_args(cmd, str(payload.get("extra_args", "")))
+
+
 class ApiHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(FRONTEND_DIR), **kwargs)
+
+    def end_headers(self):
+        # Prevent stale frontend bundles from being served from browser cache.
+        if not self.path.startswith("/api/"):
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
+        super().end_headers()
 
     def _send_json(self, payload: dict | list, status: int = 200):
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -1043,6 +1152,24 @@ class ApiHandler(SimpleHTTPRequestHandler):
             except ValueError as exc:
                 return self._send_json({"error": str(exc)}, status=400)
             job = _run_command("run", cmd)
+            return self._send_json({"job_id": job.id, "command": cmd})
+
+        if path == "/api/actions/async-server":
+            body = self._read_json()
+            try:
+                cmd = _build_async_server_command(body)
+            except ValueError as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+            job = _run_command("async-server", cmd)
+            return self._send_json({"job_id": job.id, "command": cmd})
+
+        if path == "/api/actions/async-client":
+            body = self._read_json()
+            try:
+                cmd = _build_async_client_command(body)
+            except ValueError as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+            job = _run_command("async-client", cmd)
             return self._send_json({"job_id": job.id, "command": cmd})
 
         if path == "/api/dataset/episodes/task":
