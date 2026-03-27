@@ -1,6 +1,5 @@
 import json
 import os
-import shlex
 import shutil
 import subprocess
 import sys
@@ -429,11 +428,26 @@ def _detect_lerobot_version() -> str:
 
 
 def _train_presets(version: str) -> dict:
+    def _version_tuple(v: str) -> tuple[int, int, int]:
+        try:
+            main = v.split("+", 1)[0]
+            parts = main.split(".")
+            return tuple(int(p) for p in (parts + ["0", "0"])[:3])
+        except Exception:  # noqa: BLE001
+            return (0, 0, 0)
+
+    peft_supported = _version_tuple(version) >= (0, 5, 0)
+    peft_args_default = (
+        "--peft.method_type=LORA --peft.r=64"
+        if peft_supported
+        else "--policy.freeze_vision_encoder=true --policy.train_expert_only=true --policy.train_state_proj=true"
+    )
+
     presets = [
         {
             "id": "debug_quick",
-            "label": "빠른 디버그",
-            "description": "설정/파이프라인 점검용 짧은 학습",
+            "label": "Fast Debug",
+            "description": "Short run for pipeline checks",
             "train_mode": "standard",
             "policy_type": "act",
             "train_extra_args": "--batch_size=4 --steps=2000 --save_freq=500 --log_freq=20 --eval_freq=0 --num_workers=2 --policy.push_to_hub=false",
@@ -441,8 +455,8 @@ def _train_presets(version: str) -> dict:
         },
         {
             "id": "so101_act_stable",
-            "label": "SO101 ACT 안정형",
-            "description": "SO101 실기 데이터에 무난한 ACT 기본 튜닝",
+            "label": "SO101 ACT Stable",
+            "description": "Default ACT setup for SO101",
             "train_mode": "standard",
             "policy_type": "act",
             "train_extra_args": "--batch_size=16 --steps=120000 --save_freq=20000 --eval_freq=0 --num_workers=4 --policy.use_amp=true --policy.push_to_hub=false",
@@ -450,45 +464,48 @@ def _train_presets(version: str) -> dict:
         },
         {
             "id": "so101_diffusion_balanced",
-            "label": "SO101 Diffusion 균형형",
-            "description": "Diffusion 정책 기준 기본 안정 설정",
+            "label": "SO101 Diffusion Balanced",
+            "description": "Default Diffusion setup for SO101",
             "train_mode": "standard",
             "policy_type": "diffusion",
             "train_extra_args": "--batch_size=8 --steps=180000 --save_freq=30000 --eval_freq=0 --num_workers=4 --policy.use_amp=true --policy.push_to_hub=false",
             "peft_args": "",
         },
         {
-            "id": "pi0_partial_ft",
-            "label": "PI0 부분 미세조정",
-            "description": "0.3.4에서 LoRA 대신 freeze 기반 부분 미세조정",
+            "id": "pi0_peft",
+            "label": "PI0 PEFT",
+            "description": "PEFT fine-tuning preset for PI0",
             "train_mode": "peft",
             "policy_type": "pi0",
             "train_extra_args": "--batch_size=8 --steps=60000 --save_freq=10000 --eval_freq=0 --num_workers=4 --policy.push_to_hub=false",
-            "peft_args": "--policy.freeze_vision_encoder=true --policy.train_expert_only=true --policy.train_state_proj=true",
+            "peft_args": peft_args_default,
         },
         {
-            "id": "smolvla_partial_ft",
-            "label": "SmolVLA 부분 미세조정",
-            "description": "0.3.4에서 LoRA 대신 freeze 기반 부분 미세조정",
+            "id": "smolvla_peft",
+            "label": "SmolVLA PEFT",
+            "description": "PEFT fine-tuning preset for SmolVLA",
             "train_mode": "peft",
             "policy_type": "smolvla",
             "train_extra_args": "--batch_size=8 --steps=60000 --save_freq=10000 --eval_freq=0 --num_workers=4 --policy.push_to_hub=false",
-            "peft_args": "--policy.freeze_vision_encoder=true --policy.train_expert_only=true --policy.train_state_proj=true",
+            "peft_args": peft_args_default,
         },
     ]
-
-    peft_supported = False
-    if version != "unknown":
-        # lerobot 0.3.4 기준 PEFT 전용 LoRA 인자는 기본 제공하지 않음.
-        peft_supported = False
 
     return {
         "lerobot_version": version,
         "peft_lora_builtin_supported": peft_supported,
-        "notes": [
-            "lerobot 0.3.4에서는 LoRA 전용 CLI 인자가 기본 제공되지 않습니다.",
-            "PEFT 프리셋은 freeze/train_expert_only 기반 부분 미세조정으로 구성됩니다.",
-        ],
+        "notes": (
+            [
+                "PEFT docs (main v0.5.0): use --peft.method_type and --peft.r.",
+                "Your installed lerobot supports doc-style PEFT arguments.",
+            ]
+            if peft_supported
+            else [
+                "PEFT docs (main v0.5.0) use LoRA args (--peft.method_type, --peft.r),",
+                f"but installed version ({version}) does not expose those flags.",
+                "Using freeze-based PEFT fallback preset instead.",
+            ]
+        ),
         "presets": presets,
     }
 
@@ -508,6 +525,38 @@ def _write_tasks(tasks: list[dict]) -> None:
     TASKS_FILE.write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _split_cli_args(text: str) -> list[str]:
+    """
+    Split CLI args by spaces while respecting single/double quotes.
+    Backslashes are preserved (important for Windows paths).
+    """
+    out: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+
+    for ch in str(text):
+        if quote is not None:
+            if ch == quote:
+                quote = None
+            else:
+                buf.append(ch)
+            continue
+
+        if ch in ("'", '"'):
+            quote = ch
+            continue
+        if ch.isspace():
+            if buf:
+                out.append("".join(buf))
+                buf.clear()
+            continue
+        buf.append(ch)
+
+    if buf:
+        out.append("".join(buf))
+    return out
+
+
 def _merge_cli_args(base_cmd: list[str], override_args: str) -> list[str]:
     """
     Merge '--key=value' style overrides into an existing command list.
@@ -525,7 +574,7 @@ def _merge_cli_args(base_cmd: list[str], override_args: str) -> list[str]:
             key = tok.split("=", 1)[0]
             key_to_index[key] = i
 
-    for tok in shlex.split(text, posix=False):
+    for tok in _split_cli_args(text):
         if tok.startswith("--") and "=" in tok:
             key = tok.split("=", 1)[0]
             if key in key_to_index:
@@ -610,7 +659,7 @@ def _build_record_command(payload: dict) -> list[str]:
     robot_port = str(payload.get("robot_port", "")).strip()
     teleop_port = str(payload.get("teleop_port", "")).strip()
     if not dataset_repo_id:
-        raise ValueError("dataset_repo_id is required (예: yourname/so101_task)")
+        raise ValueError("dataset_repo_id is required (?? yourname/so101_task)")
     if not robot_port:
         raise ValueError("robot_port is required")
     if not teleop_port:
@@ -647,6 +696,11 @@ def _build_record_command(payload: dict) -> list[str]:
     if resume_flag and not _local_dataset_exists(dataset_repo_id):
         # Safety: prevent 404 on first-time dataset creation.
         resume_flag = False
+    single_task = (
+        str(payload.get("single_task", "")).strip()
+        or str(payload.get("name", "")).strip()
+        or "web_collected_task"
+    )
 
     cmd = [
         "lerobot-record",
@@ -658,9 +712,10 @@ def _build_record_command(payload: dict) -> list[str]:
         "--teleop.type=so101_leader",
         f"--teleop.port={teleop_port}",
         f"--teleop.id={payload['teleop_id']}",
-        "--dataset.single_task=web_collected_task",
+        f"--dataset.single_task={single_task}",
         f"--dataset.num_episodes={payload.get('num_episodes', 20)}",
         f"--dataset.episode_time_s={payload.get('episode_time_s', 30)}",
+        f"--dataset.reset_time_s={payload.get('dataset_reset_time_s', 5)}",
         f"--dataset.fps={payload.get('fps', 30)}",
         f"--resume={str(resume_flag).lower()}",
     ]
@@ -670,7 +725,7 @@ def _build_record_command(payload: dict) -> list[str]:
 def _build_train_command(payload: dict) -> list[str]:
     dataset = str(payload.get("dataset_repo_id", "")).strip()
     if not dataset:
-        raise ValueError("dataset_repo_id is required (예: yourname/so101_task)")
+        raise ValueError("dataset_repo_id is required (?? yourname/so101_task)")
     job_name = payload.get("job_name", f"so101_{int(time.time())}")
     output_dir = payload.get("output_dir", f"outputs/train/{job_name}")
     policy_type = payload.get("policy_type", "act")
@@ -688,7 +743,7 @@ def _build_train_command(payload: dict) -> list[str]:
     if payload.get("train_mode", "standard") == "peft":
         peft_args = str(payload.get("peft_args", "")).strip()
         if peft_args:
-            cmd.extend(shlex.split(peft_args, posix=False))
+            cmd.extend(_split_cli_args(peft_args))
 
     return _merge_cli_args(cmd, str(payload.get("extra_args", "")))
 
@@ -698,11 +753,19 @@ def _build_run_command(payload: dict) -> list[str]:
     robot_port = str(payload.get("robot_port", "")).strip()
     policy_path = str(payload.get("policy_path", "")).strip()
     if not dataset_repo_id:
-        raise ValueError("dataset_repo_id is required (예: yourname/eval_so101_task)")
+        raise ValueError("dataset_repo_id is required (?? yourname/eval_so101_task)")
     if not robot_port:
         raise ValueError("robot_port is required")
     if not policy_path:
         raise ValueError("policy_path is required")
+
+    # lerobot-record policy-run expects eval datasets.
+    if "/" in dataset_repo_id:
+        owner, name = dataset_repo_id.split("/", 1)
+        if not name.startswith("eval_"):
+            dataset_repo_id = f"{owner}/eval_{name}"
+    elif not dataset_repo_id.startswith("eval_"):
+        dataset_repo_id = f"eval_{dataset_repo_id}"
 
     cameras: dict[str, dict] = {}
     if payload.get("top_camera_enabled", True):
@@ -1104,3 +1167,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

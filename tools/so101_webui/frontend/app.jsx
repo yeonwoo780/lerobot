@@ -1,4 +1,4 @@
-﻿const { useEffect, useMemo, useRef, useState } = React;
+const { useEffect, useMemo, useRef, useState } = React;
 
 const defaultForm = {
   name: "",
@@ -10,12 +10,13 @@ const defaultForm = {
   teleop_id: "so101_leader_1",
   fps: 30,
   episode_time_s: 30,
+  dataset_reset_time_s: 5,
   num_episodes: 20,
   policy_type: "act",
   device: "cuda",
   peft_args: "",
-  train_extra_args: "",
-  record_extra_args: "",
+  train_args: "--batch_size=8 --steps=60000 --save_freq=10000 --eval_freq=0 --num_workers=4 --policy.push_to_hub=false",
+  record_args: "--dataset.single_task=web_collected_task --dataset.num_episodes=20 --dataset.episode_time_s=30 --dataset.reset_time_s=5 --dataset.fps=30 --resume=false",
   run_args: "",
   policy_path: "",
   record_append: false,
@@ -42,6 +43,44 @@ const defaultForm = {
   wrist_camera_fps: 30,
 };
 
+function upsertCliArg(args, key, value) {
+  const safeValue = String(value);
+  const quoted = /\s/.test(safeValue) ? `"${safeValue}"` : safeValue;
+  const arg = `--${key}=${quoted}`;
+  const text = String(args || "").trim();
+  const escapedKey = String(key).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`--${escapedKey}=(?:\"[^\"]*\"|'[^']*'|.*?)(?=\\s--[A-Za-z0-9_.-]+(?:=|\\b)|$)`);
+  if (!text) return arg;
+  if (re.test(text)) return text.replace(re, arg);
+  return `${text} ${arg}`.trim();
+}
+
+function syncRecordArgs(recordArgs, form) {
+  let out = String(recordArgs || "").trim();
+  const recordTask = String(form.single_task || "").trim() || "web_collected_task";
+  out = upsertCliArg(out, "dataset.single_task", recordTask);
+  out = upsertCliArg(out, "dataset.num_episodes", Number(form.num_episodes));
+  out = upsertCliArg(out, "dataset.episode_time_s", Number(form.episode_time_s));
+  out = upsertCliArg(out, "dataset.reset_time_s", Number(form.dataset_reset_time_s));
+  out = upsertCliArg(out, "dataset.fps", Number(form.fps));
+  out = upsertCliArg(out, "resume", String(Boolean(form.record_append)).toLowerCase());
+  return out;
+}
+
+function syncRunArgs(runArgs, form) {
+  let out = String(runArgs || "").trim();
+  const runTask = String(form.single_task || "").trim() || String(form.name || "").trim() || "web_policy_run";
+  out = upsertCliArg(out, "dataset.single_task", runTask);
+  out = upsertCliArg(out, "dataset.num_episodes", Number(form.num_episodes));
+  out = upsertCliArg(out, "dataset.episode_time_s", Number(form.episode_time_s));
+  out = upsertCliArg(out, "dataset.fps", Number(form.fps));
+  out = upsertCliArg(out, "resume", String(Boolean(form.record_append)).toLowerCase());
+  if (String(form.policy_path || "").trim()) {
+    out = upsertCliArg(out, "policy.path", String(form.policy_path).trim());
+  }
+  return out;
+}
+
 function App() {
   const [activePage, setActivePage] = useState("dashboard");
 
@@ -49,7 +88,11 @@ function App() {
   const [datasets, setDatasets] = useState([]);
   const [jobs, setJobs] = useState([]);
   const [selectedId, setSelectedId] = useState(null);
-  const [form, setForm] = useState(defaultForm);
+  const [form, setForm] = useState(() => ({
+    ...defaultForm,
+    record_args: syncRecordArgs(defaultForm.record_args, defaultForm),
+    run_args: syncRunArgs(defaultForm.run_args, defaultForm),
+  }));
   const [trainMode, setTrainMode] = useState("standard");
   const [lastCommand, setLastCommand] = useState("");
 
@@ -120,25 +163,41 @@ function App() {
   }, [jobs]);
 
   function updateForm(patch) {
-    setForm((prev) => ({ ...prev, ...patch }));
+    setForm((prev) => {
+      const next = { ...prev, ...patch };
+      const patchKeys = Object.keys(patch || {});
+      const directArgEdit = patchKeys.includes("record_args") || patchKeys.includes("run_args");
+      if (!directArgEdit) {
+        next.record_args = syncRecordArgs(next.record_args, next);
+        next.run_args = syncRunArgs(next.run_args, next);
+      }
+      return next;
+    });
   }
 
   function loadTask(t) {
     setSelectedId(t.id);
-    setForm({
+    const loaded = {
       ...defaultForm,
       ...t,
-      train_extra_args: t.train_extra_args || "",
-      record_extra_args: t.record_extra_args || "",
+      train_args: t.train_args || t.train_extra_args || defaultForm.train_args,
+      record_args: t.record_args || t.record_extra_args || defaultForm.record_args,
       run_args: t.run_args || t.run_extra_args || "",
       peft_args: t.peft_args || "",
-    });
+    };
+    loaded.record_args = syncRecordArgs(loaded.record_args, loaded);
+    loaded.run_args = syncRunArgs(loaded.run_args, loaded);
+    setForm(loaded);
     if (t.dataset_repo_id) setDatasetRepoId(t.dataset_repo_id);
   }
 
   function resetForm() {
     setSelectedId(null);
-    setForm(defaultForm);
+    setForm({
+      ...defaultForm,
+      record_args: syncRecordArgs(defaultForm.record_args, defaultForm),
+      run_args: syncRunArgs(defaultForm.run_args, defaultForm),
+    });
   }
 
   async function saveTask() {
@@ -146,6 +205,7 @@ function App() {
       ...form,
       fps: Number(form.fps),
       episode_time_s: Number(form.episode_time_s),
+      dataset_reset_time_s: Number(form.dataset_reset_time_s),
       num_episodes: Number(form.num_episodes),
       top_camera_width: Number(form.top_camera_width),
       top_camera_height: Number(form.top_camera_height),
@@ -217,6 +277,7 @@ function App() {
       policy_path: kind === "run" ? policyPath : form.policy_path,
       fps: Number(form.fps),
       episode_time_s: Number(form.episode_time_s),
+      dataset_reset_time_s: Number(form.dataset_reset_time_s),
       num_episodes: Number(form.num_episodes),
       top_camera_width: Number(form.top_camera_width),
       top_camera_height: Number(form.top_camera_height),
@@ -231,9 +292,9 @@ function App() {
 
     if (kind === "train") {
       payload.train_mode = trainMode;
-      payload.extra_args = form.train_extra_args || "";
+      payload.extra_args = form.train_args || "";
     }
-    if (kind === "record") payload.extra_args = form.record_extra_args || "";
+    if (kind === "record") payload.extra_args = form.record_args || "";
     if (kind === "run") payload.extra_args = form.run_args || "";
 
     const res = await api(`/api/actions/${kind}`, { method: "POST", body: JSON.stringify(payload) });
@@ -272,7 +333,7 @@ function App() {
     setTrainMode(preset.train_mode || "standard");
     updateForm({
       policy_type: preset.policy_type || form.policy_type,
-      train_extra_args: preset.train_extra_args || "",
+      train_args: preset.train_extra_args || form.train_args,
       peft_args: preset.peft_args || "",
     });
   }
@@ -350,6 +411,7 @@ function App() {
             <label>Teleop ID<input value={form.teleop_id} onChange={(e) => updateForm({ teleop_id: e.target.value })} /></label>
             <label>FPS<input type="number" value={form.fps} onChange={(e) => updateForm({ fps: e.target.value })} /></label>
             <label>Episode Time (s)<input type="number" value={form.episode_time_s} onChange={(e) => updateForm({ episode_time_s: e.target.value })} /></label>
+            <label>Reset Time (s)<input type="number" value={form.dataset_reset_time_s} onChange={(e) => updateForm({ dataset_reset_time_s: e.target.value })} /></label>
             <label>Num Episodes<input type="number" value={form.num_episodes} onChange={(e) => updateForm({ num_episodes: e.target.value })} /></label>
             <label>Policy Type
               <select value={form.policy_type} onChange={(e) => updateForm({ policy_type: e.target.value })}>
@@ -476,7 +538,7 @@ function App() {
             </select>
           </label>
 
-          <label>Record 추가 인자<textarea value={form.record_extra_args} onChange={(e) => updateForm({ record_extra_args: e.target.value })} /></label>
+          <label>Record 인자<textarea value={form.record_args} onChange={(e) => updateForm({ record_args: e.target.value })} /></label>
           <button onClick={() => startAction("record")}>데이터 수집 시작</button>
 
           <label style={{ marginTop: 8 }}>학습 모드
@@ -488,7 +550,7 @@ function App() {
           {trainMode === "peft" && (
             <label>PEFT 인자<textarea value={form.peft_args} onChange={(e) => updateForm({ peft_args: e.target.value })} /></label>
           )}
-          <label>Train 추가 인자<textarea value={form.train_extra_args} onChange={(e) => updateForm({ train_extra_args: e.target.value })} /></label>
+          <label>Train 인자<textarea value={form.train_args} onChange={(e) => updateForm({ train_args: e.target.value })} /></label>
           <button onClick={() => startAction("train")}>학습 시작</button>
 
           <label style={{ marginTop: 8 }}>Run 인자<textarea value={form.run_args} onChange={(e) => updateForm({ run_args: e.target.value })} /></label>

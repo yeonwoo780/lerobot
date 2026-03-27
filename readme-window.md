@@ -39,7 +39,7 @@ uv run lerobot-teleoperate --robot.type=so101_follower --robot.port=COM5 --robot
 **record dataset**
 
 ```bash
-uv run lerobot-record --robot.type=so101_follower --robot.port=COM5 --robot.cameras="{front: {type: opencv, index_or_path: 1, width: 640, height: 480, fps: 30 }}" --robot.id=follower --teleop.type=so101_leader --teleop.port=COM6 --teleop.id=leader --dataset.repo_id=yeonwoo780/record_m --dataset.num_episodes=5 --dataset.single_task="Grab the erazer"
+uv run lerobot-record --robot.type=so101_follower --robot.port=COM5 --robot.cameras="{ top: {type: opencv, index_or_path: 2, width: 640, height: 480, fps: 30}, wrist: {type: opencv, index_or_path: 0, width: 640, height: 480, fps: 30}}" --robot.id=follower --teleop.type=so101_leader --teleop.port=COM6 --teleop.id=leader --dataset.repo_id=yeonwoo780/record_m --dataset.num_episodes=5 --dataset.single_task="Grab the erazer" --dataset.reset_time_s=5
 ```
 
 **replay dataset**
